@@ -6,6 +6,31 @@ const CDP_HOST = 'localhost';
 const CDP_PORT = 9222;
 const MAX_RETRIES = 5;
 const BASE_DELAY = 500;
+const LIVENESS_TIMEOUT = 3000;
+const CONNECT_TIMEOUT = 10000;
+const EVAL_TIMEOUT = 30000;
+
+const RECOVERY_HINT = 'TradingView\'s renderer is suspended or the app was closed/updated. '
+  + 'Bring a TradingView chart window to the foreground, or re-run "TradingView (Debug).command" to restart it with the debug port.';
+
+// CDP calls against a discarded/suspended renderer never resolve OR reject —
+// without a deadline a single dead renderer hangs every tool call forever.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s. ${RECOVERY_HINT}`)), ms);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
+async function dropClient() {
+  const dead = client;
+  client = null;
+  targetInfo = null;
+  if (dead) {
+    try { await withTimeout(dead.close(), 1000, 'CDP close'); } catch {}
+  }
+}
 
 // Known direct API paths discovered via live probing (see PROBE_RESULTS.md)
 const KNOWN_PATHS = {
@@ -50,12 +75,15 @@ export function requireFinite(value, name) {
 export async function getClient() {
   if (client) {
     try {
-      // Quick liveness check
-      await client.Runtime.evaluate({ expression: '1', returnByValue: true });
+      // Quick liveness check — bounded, because a suspended renderer hangs instead of erroring
+      await withTimeout(
+        client.Runtime.evaluate({ expression: '1', returnByValue: true }),
+        LIVENESS_TIMEOUT,
+        'CDP liveness check'
+      );
       return client;
     } catch {
-      client = null;
-      targetInfo = null;
+      await dropClient();
     }
   }
   return connect();
@@ -70,25 +98,34 @@ export async function connect() {
         throw new Error('No TradingView chart target found. Is TradingView open with a chart?');
       }
       targetInfo = target;
-      client = await CDP({ host: CDP_HOST, port: CDP_PORT, target: target.id });
+      client = await withTimeout(
+        CDP({ host: CDP_HOST, port: CDP_PORT, target: target.id }),
+        CONNECT_TIMEOUT,
+        'CDP connect'
+      );
 
-      // Enable required domains
-      await client.Runtime.enable();
-      await client.Page.enable();
-      await client.DOM.enable();
+      // Enable required domains — these hang (not reject) on a discarded renderer
+      await withTimeout(
+        Promise.all([client.Runtime.enable(), client.Page.enable(), client.DOM.enable()]),
+        CONNECT_TIMEOUT,
+        'CDP domain enable'
+      );
 
       return client;
     } catch (err) {
       lastError = err;
+      await dropClient();
+      // A timeout means the renderer is suspended — retrying won't wake it, so fail fast
+      if (/timed out/.test(err?.message || '')) break;
       const delay = Math.min(BASE_DELAY * Math.pow(2, attempt), 30000);
       await new Promise(r => setTimeout(r, delay));
     }
   }
-  throw new Error(`CDP connection failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
+  throw new Error(`CDP connection failed: ${lastError?.message}`);
 }
 
 async function findChartTarget() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`, { signal: AbortSignal.timeout(3000) });
   const targets = await resp.json();
   // Prefer targets with tradingview.com/chart in the URL
   return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
@@ -104,13 +141,26 @@ export async function getTargetInfo() {
 }
 
 export async function evaluate(expression, opts = {}) {
+  const { timeoutMs = EVAL_TIMEOUT, ...cdpOpts } = opts;
   const c = await getClient();
-  const result = await c.Runtime.evaluate({
-    expression,
-    returnByValue: true,
-    awaitPromise: opts.awaitPromise ?? false,
-    ...opts,
-  });
+  let result;
+  try {
+    result = await withTimeout(
+      c.Runtime.evaluate({
+        expression,
+        returnByValue: true,
+        awaitPromise: cdpOpts.awaitPromise ?? false,
+        ...cdpOpts,
+      }),
+      timeoutMs,
+      'CDP evaluate'
+    );
+  } catch (err) {
+    // A hung evaluate means the renderer is gone — drop the cached client so the
+    // next call reconnects instead of hanging on the same dead socket.
+    await dropClient();
+    throw err;
+  }
   if (result.exceptionDetails) {
     const msg = result.exceptionDetails.exception?.description
       || result.exceptionDetails.text
