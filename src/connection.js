@@ -24,11 +24,52 @@ function withTimeout(promise, ms, label) {
 }
 
 async function dropClient() {
+  stopKeepalive();
   const dead = client;
   client = null;
   targetInfo = null;
   if (dead) {
     try { await withTimeout(dead.close(), 1000, 'CDP close'); } catch {}
+  }
+}
+
+// Periodic activity keeps Chromium from suspending/discarding the chart renderer
+// while a session is attached (occluded or backgrounded windows are the trigger).
+let keepaliveTimer = null;
+const KEEPALIVE_INTERVAL = 30000;
+
+function startKeepalive() {
+  stopKeepalive();
+  keepaliveTimer = setInterval(() => {
+    client?.Runtime.evaluate({ expression: '1', returnByValue: true }).catch(() => {});
+  }, KEEPALIVE_INTERVAL);
+  keepaliveTimer.unref?.();
+}
+
+function stopKeepalive() {
+  if (keepaliveTimer) {
+    clearInterval(keepaliveTimer);
+    keepaliveTimer = null;
+  }
+}
+
+// A suspended renderer ignores Runtime/DOM commands, but Page.navigate is serviced
+// by the browser process and respawns the renderer (verified on this machine:
+// renderer count 0→1, Runtime.enable 40s-hang → 6ms).
+async function reviveRenderer() {
+  const target = await findChartTarget();
+  if (!target) throw new Error('No TradingView target to revive');
+  const c = await withTimeout(
+    CDP({ host: CDP_HOST, port: CDP_PORT, target: target.id }),
+    5000,
+    'revive connect'
+  );
+  try {
+    await withTimeout(c.Page.navigate({ url: target.url }), 5000, 'revive navigate');
+    // Give the chart time to reload before the caller reconnects
+    await new Promise(r => setTimeout(r, 4000));
+  } finally {
+    try { await c.close(); } catch {}
   }
 }
 
@@ -91,6 +132,7 @@ export async function getClient() {
 
 export async function connect() {
   let lastError;
+  let revived = false;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
       const target = await findChartTarget();
@@ -111,12 +153,20 @@ export async function connect() {
         'CDP domain enable'
       );
 
+      startKeepalive();
       return client;
     } catch (err) {
       lastError = err;
       await dropClient();
-      // A timeout means the renderer is suspended — retrying won't wake it, so fail fast
-      if (/timed out/.test(err?.message || '')) break;
+      if (/timed out/.test(err?.message || '')) {
+        // Timeout = suspended renderer. Try to respawn it once via Page.navigate,
+        // then loop back for a fresh connect. If that fails too, give up fast.
+        if (!revived) {
+          revived = true;
+          try { await reviveRenderer(); continue; } catch {}
+        }
+        break;
+      }
       const delay = Math.min(BASE_DELAY * Math.pow(2, attempt), 30000);
       await new Promise(r => setTimeout(r, delay));
     }
@@ -175,6 +225,7 @@ export async function evaluateAsync(expression) {
 }
 
 export async function disconnect() {
+  stopKeepalive();
   if (client) {
     try { await client.close(); } catch {}
     client = null;
